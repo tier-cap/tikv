@@ -66,8 +66,8 @@ const DEL_RANGE_PREFIX: &str = "del_range";
 
 const TMP_FILE_SUFFIX: &str = ".tmp";
 const SST_FILE_SUFFIX: &str = ".sst";
-const CLONE_FILE_SUFFIX: &str = ".clone";
-const META_FILE_SUFFIX: &str = ".meta";
+pub const CLONE_FILE_SUFFIX: &str = ".clone";
+pub const META_FILE_SUFFIX: &str = ".meta";
 
 const DELETE_RETRY_MAX_TIMES: u32 = 6;
 const DELETE_RETRY_TIME_MILLIS: u64 = 500;

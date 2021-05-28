@@ -24,10 +24,12 @@ use std::{
 use concurrency_manager::ConcurrencyManager;
 use encryption_export::{data_key_manager_from_config, DataKeyManager};
 use engine_rocks::{
-    encryption::get_env as get_encrypted_env, file_system::get_env as get_inspected_env,
+    encryption::get_env as get_encrypted_env, file_system::get_env as get_inspected_env, util,
     RocksEngine,
 };
-use engine_traits::{compaction_job::CompactionJobInfo, Engines, RaftEngine, CF_DEFAULT, CF_WRITE};
+use engine_traits::{
+    compaction_job::CompactionJobInfo, Engines, RaftEngine, ALL_CFS, CF_DEFAULT, CF_WRITE,
+};
 use error_code::ErrorCodeExt;
 use file_system::{
     set_io_rate_limiter, BytesFetcher, IORateLimiter, MetricsManager as IOMetricsManager,
@@ -51,7 +53,7 @@ use raftstore::{
         config::RaftstoreConfigManager,
         fsm,
         fsm::store::{RaftBatchSystem, RaftRouter, StoreMeta, PENDING_MSG_CAP},
-        AutoSplitController, GlobalReplicationState, LocalReader, SnapManagerBuilder,
+        snap, AutoSplitController, GlobalReplicationState, LocalReader, SnapManagerBuilder,
         SplitCheckRunner, SplitConfigManager, StoreMsg,
     },
 };
@@ -88,6 +90,8 @@ use tokio::runtime::Builder;
 use crate::raft_engine_switch::{check_and_dump_raft_db, check_and_dump_raft_engine};
 use crate::{setup::*, signal_handler};
 
+const GBSIZE: u64 = 1024 * 1024 * 1024;
+
 /// Run a TiKV server. Returns when the server is shutdown by the user, in which
 /// case the server will be properly stopped.
 pub fn run_tikv(config: TiKvConfig) {
@@ -118,10 +122,11 @@ pub fn run_tikv(config: TiKvConfig) {
             tikv.init_encryption();
             let (limiter, fetcher) = tikv.init_io_utility();
             let engines = tikv.init_raw_engines(Some(limiter.clone()));
-            tikv.init_engines(engines);
+            tikv.init_engines(engines.clone());
             let server_config = tikv.init_servers();
             tikv.register_services();
             tikv.init_metrics_flusher(fetcher);
+            tikv.init_storage_stats_task(engines);
             tikv.run_server(server_config);
             tikv.run_status_server();
 
@@ -140,6 +145,7 @@ pub fn run_tikv(config: TiKvConfig) {
 const RESERVED_OPEN_FDS: u64 = 1000;
 
 const DEFAULT_METRICS_FLUSH_INTERVAL: Duration = Duration::from_millis(10_000);
+const DEFAULT_STORAGE_STATS_INTERVAL: Duration = Duration::from_secs(10);
 
 /// A complete TiKV server.
 struct TiKVServer<ER: RaftEngine> {
@@ -152,6 +158,8 @@ struct TiKVServer<ER: RaftEngine> {
     resolver: resolve::PdStoreAddrResolver,
     state: Arc<Mutex<GlobalReplicationState>>,
     store_path: PathBuf,
+    snap_path: PathBuf,
+    //raft_path: Pathbuf, currently not impl.
     encryption_key_manager: Option<Arc<DataKeyManager>>,
     engines: Option<TiKVEngines<ER>>,
     servers: Option<Servers<ER>>,
@@ -162,6 +170,7 @@ struct TiKVServer<ER: RaftEngine> {
     concurrency_manager: ConcurrencyManager,
     env: Arc<Environment>,
     background_worker: Worker,
+    write_permission: Arc<Mutex<bool>>,
 }
 
 struct TiKVEngines<ER: RaftEngine> {
@@ -231,7 +240,8 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             system: Some(system),
             resolver,
             state,
-            store_path,
+            store_path: store_path.clone(),
+            snap_path: store_path.join(Path::new("snap")),
             encryption_key_manager: None,
             engines: None,
             servers: None,
@@ -242,6 +252,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             concurrency_manager,
             env,
             background_worker,
+            write_permission: Arc::new(Mutex::new(true)),
         }
     }
 
@@ -583,12 +594,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             .register(self.coprocessor_host.as_mut().unwrap());
 
         // Create snapshot manager, server.
-        let snap_path = self
-            .store_path
-            .join(Path::new("snap"))
-            .to_str()
-            .unwrap()
-            .to_owned();
+        let snap_path = self.snap_path.clone().to_str().unwrap().to_owned();
 
         let bps = i64::try_from(self.config.server.snap_max_write_bytes_per_sec.0)
             .unwrap_or_else(|_| fatal!("snap_max_write_bytes_per_sec > i64::max_value"));
@@ -936,6 +942,83 @@ impl<ER: RaftEngine> TiKVServer<ER> {
                 engine_metrics.flush(duration);
                 io_metrics.flush(duration);
             });
+    }
+    fn init_storage_stats_task(&self, engines: Engines<RocksEngine, ER>) {
+        let flag = self.write_permission.clone();
+        let config_disk_capacity: u64 = self.config.raft_store.capacity.0;
+        let store_path = self.store_path.clone();
+        let snap_path = self.snap_path.clone();
+        self.background_worker
+            .spawn_interval_task(DEFAULT_STORAGE_STATS_INTERVAL, move || {
+                let disk_stats = match fs2::statvfs(&store_path) {
+                    Err(e) => {
+                        error!(
+                            "get disk stat for kv store failed";
+                            "kv path"=>store_path.to_str(),
+                            "err"=>?e
+                        );
+                        return;
+                    }
+                    Ok(stats) => stats,
+                };
+                let disk_cap = disk_stats.total_space();
+                let disk_available = disk_stats.available_space();
+                let snap_size = (|| -> Option<u64> {
+                    let mut total_size = 0;
+                    for entry in fs::read_dir(&snap_path).unwrap() {
+                        let (entry, metadata) =
+                            match entry.and_then(|e| e.metadata().map(|m| (e, m))) {
+                                Ok((e, m)) => (e, m),
+                                Err(_e) => return Some(0), //TODO Fixit?
+                            };
+
+                        let path = entry.path();
+                        let path_s = path.to_str().unwrap();
+                        // Ignore cloned files as they are hard links on posix systems.
+                        if !metadata.is_file()
+                            || path_s.ends_with(snap::CLONE_FILE_SUFFIX)
+                            || path_s.ends_with(snap::META_FILE_SUFFIX)
+                        {
+                            continue;
+                        }
+                        total_size += metadata.len();
+                    }
+                    Some(total_size)
+                })()
+                .unwrap();
+                let kv_size: u64 = (|| -> u64 {
+                    let mut used_size: u64 = 0;
+                    for cf in ALL_CFS {
+                        let handle = util::get_cf_handle(engines.kv.as_inner(), cf).unwrap();
+                        used_size += util::get_engine_cf_used_size(engines.kv.as_inner(), handle);
+                    }
+                    used_size
+                })();
+                let total_used = snap_size + kv_size;
+                let capacity = if config_disk_capacity == 0 || disk_cap < config_disk_capacity {
+                    disk_cap
+                } else {
+                    config_disk_capacity
+                };
+                if total_used * 100 / capacity >= 95 {
+                    warn!(
+                        "disk usage threshold：total used {:?}, config cap={:?}, disk available={:?}",
+                        total_used / GBSIZE,
+                        config_disk_capacity / GBSIZE,
+                        disk_available/GBSIZE
+                    );
+                    let mut f = flag.lock().unwrap();
+                    *f = false;
+                } else {
+                    let mut f = flag.lock().unwrap();
+                    *f = true;
+                }
+
+                warn!(
+                    "disk capacity checking, disk capacity={:?},kv_size={:?},snap_size={:?},config-cap={:?},flag{:?}",
+                    disk_cap, kv_size,   snap_size,config_disk_capacity,flag
+                );
+            })
     }
 
     fn run_server(&mut self, server_config: Arc<VersionTrack<ServerConfig>>) {

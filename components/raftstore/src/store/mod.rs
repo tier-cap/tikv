@@ -19,7 +19,7 @@ mod peer_storage;
 mod read_queue;
 mod region_snapshot;
 mod replication_mode;
-mod snap;
+pub mod snap;
 mod worker;
 
 pub use self::bootstrap::{
