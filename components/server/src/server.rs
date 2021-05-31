@@ -17,7 +17,7 @@ use std::{
     fs::{self, File},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicU64, Arc, Mutex},
+    sync::{atomic::AtomicU64, atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -53,7 +53,8 @@ use raftstore::{
         config::RaftstoreConfigManager,
         fsm,
         fsm::store::{RaftBatchSystem, RaftRouter, StoreMeta, PENDING_MSG_CAP},
-        snap, AutoSplitController, GlobalReplicationState, LocalReader, SnapManagerBuilder,
+        snap::SnapManager,
+        AutoSplitController, GlobalReplicationState, LocalReader, SnapManagerBuilder,
         SplitCheckRunner, SplitConfigManager, StoreMsg,
     },
 };
@@ -81,6 +82,7 @@ use tikv::{
 use tikv_util::{
     check_environment_variables,
     config::{ensure_dir_exist, VersionTrack},
+    sys::disk,
     sys::sys_quota::SysQuota,
     time::Monitor,
     worker::{Builder as WorkerBuilder, FutureWorker, LazyWorker, Worker},
@@ -158,7 +160,7 @@ struct TiKVServer<ER: RaftEngine> {
     resolver: resolve::PdStoreAddrResolver,
     state: Arc<Mutex<GlobalReplicationState>>,
     store_path: PathBuf,
-    snap_path: PathBuf,
+    snap_mgr: Option<SnapManager>,
     //raft_path: Pathbuf, currently not impl.
     encryption_key_manager: Option<Arc<DataKeyManager>>,
     engines: Option<TiKVEngines<ER>>,
@@ -170,7 +172,6 @@ struct TiKVServer<ER: RaftEngine> {
     concurrency_manager: ConcurrencyManager,
     env: Arc<Environment>,
     background_worker: Worker,
-    write_permission: Arc<Mutex<bool>>,
 }
 
 struct TiKVEngines<ER: RaftEngine> {
@@ -241,7 +242,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             resolver,
             state,
             store_path: store_path.clone(),
-            snap_path: store_path.join(Path::new("snap")),
+            snap_mgr: None,
             encryption_key_manager: None,
             engines: None,
             servers: None,
@@ -252,7 +253,6 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             concurrency_manager,
             env,
             background_worker,
-            write_permission: Arc::new(Mutex::new(true)),
         }
     }
 
@@ -594,7 +594,12 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             .register(self.coprocessor_host.as_mut().unwrap());
 
         // Create snapshot manager, server.
-        let snap_path = self.snap_path.clone().to_str().unwrap().to_owned();
+        let snap_path = self
+            .store_path
+            .join(Path::new("snap"))
+            .to_str()
+            .unwrap()
+            .to_owned();
 
         let bps = i64::try_from(self.config.server.snap_max_write_bytes_per_sec.0)
             .unwrap_or_else(|_| fatal!("snap_max_write_bytes_per_sec > i64::max_value"));
@@ -646,6 +651,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         node.try_bootstrap_store(engines.engines.clone())
             .unwrap_or_else(|e| fatal!("failed to bootstrap node id: {}", e));
 
+        self.snap_mgr = Some(snap_mgr.clone());
         // Create server
         let server = Server::new(
             node.id(),
@@ -944,10 +950,9 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             });
     }
     fn init_storage_stats_task(&self, engines: Engines<RocksEngine, ER>) {
-        let flag = self.write_permission.clone();
         let config_disk_capacity: u64 = self.config.raft_store.capacity.0;
         let store_path = self.store_path.clone();
-        let snap_path = self.snap_path.clone();
+        let snap_mgr = self.snap_mgr.clone().unwrap();
         self.background_worker
             .spawn_interval_task(DEFAULT_STORAGE_STATS_INTERVAL, move || {
                 let disk_stats = match fs2::statvfs(&store_path) {
@@ -963,29 +968,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
                 };
                 let disk_cap = disk_stats.total_space();
                 let disk_available = disk_stats.available_space();
-                let snap_size = (|| -> Option<u64> {
-                    let mut total_size = 0;
-                    for entry in fs::read_dir(&snap_path).unwrap() {
-                        let (entry, metadata) =
-                            match entry.and_then(|e| e.metadata().map(|m| (e, m))) {
-                                Ok((e, m)) => (e, m),
-                                Err(_e) => return Some(0), //TODO Fixit?
-                            };
-
-                        let path = entry.path();
-                        let path_s = path.to_str().unwrap();
-                        // Ignore cloned files as they are hard links on posix systems.
-                        if !metadata.is_file()
-                            || path_s.ends_with(snap::CLONE_FILE_SUFFIX)
-                            || path_s.ends_with(snap::META_FILE_SUFFIX)
-                        {
-                            continue;
-                        }
-                        total_size += metadata.len();
-                    }
-                    Some(total_size)
-                })()
-                .unwrap();
+                let snap_size = snap_mgr.get_total_snap_size().unwrap();
                 let kv_size: u64 = (|| -> u64 {
                     let mut used_size: u64 = 0;
                     for cf in ALL_CFS {
@@ -1007,16 +990,14 @@ impl<ER: RaftEngine> TiKVServer<ER> {
                         config_disk_capacity / GBSIZE,
                         disk_available/GBSIZE
                     );
-                    let mut f = flag.lock().unwrap();
-                    *f = false;
+                    disk::WRITE_PERMISSION.store(false, Ordering::Release);
                 } else {
-                    let mut f = flag.lock().unwrap();
-                    *f = true;
+                    disk::WRITE_PERMISSION.store(true, Ordering::Release);
                 }
 
                 warn!(
-                    "disk capacity checking, disk capacity={:?},kv_size={:?},snap_size={:?},config-cap={:?},flag{:?}",
-                    disk_cap, kv_size,   snap_size,config_disk_capacity,flag
+                    "disk capacity checking, disk capacity={:?},kv_size={:?},snap_size={:?},config-cap={:?},flag={:?}",
+                    disk_cap, kv_size, snap_size, config_disk_capacity, disk::WRITE_PERMISSION
                 );
             })
     }
