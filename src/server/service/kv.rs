@@ -1,5 +1,6 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tikv_util::time::{duration_to_sec, Instant};
 
@@ -40,14 +41,15 @@ use kvproto::mpp::*;
 use kvproto::raft_cmdpb::{CmdType, RaftCmdRequest, RaftRequestHeader, Request as RaftRequest};
 use kvproto::raft_serverpb::*;
 use kvproto::tikvpb::*;
+use raft::eraftpb::MessageType;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::{Callback, CasualMessage, StoreMsg};
 use raftstore::{DiscardReason, Error as RaftStoreError};
 use tikv_util::future::{paired_future_callback, poll_future_notify};
 use tikv_util::mpsc::batch::{unbounded, BatchCollector, BatchReceiver, Sender};
+use tikv_util::sys::disk;
 use tikv_util::worker::Scheduler;
 use txn_types::{self, Key};
-
 const GRPC_MSG_MAX_BATCH_SIZE: usize = 128;
 const GRPC_MSG_NOTIFY_SIZE: usize = 8;
 
@@ -625,8 +627,19 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                         my_store_id: store_id,
                     }))
                 } else {
-                    let ret = ch.send_raft_msg(msg).map_err(Error::from);
-                    future::ready(ret)
+                    let mut flag = true;
+                    if !disk::WRITE_PERMISSION.load(Ordering::Acquire) {
+                        let msg_type = msg.get_message().get_msg_type();
+                        if msg_type == MessageType::MsgAppend {
+                            flag = false;
+                        }
+                    }
+                    if flag {
+                        let ret = ch.send_raft_msg(msg).map_err(Error::from);
+                        return future::ready(ret);
+                    } else {
+                        return future::err(Error::from(RaftStoreError::DiskFull));
+                    }
                 }
             });
             let status = match res.await {
@@ -666,8 +679,19 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                             my_store_id: store_id,
                         }));
                     }
-                    if let Err(e) = ch.send_raft_msg(msg) {
-                        return future::err(Error::from(e));
+                    let mut flag = true;
+                    if !disk::WRITE_PERMISSION.load(Ordering::Acquire) {
+                        let msg_type = msg.get_message().get_msg_type();
+                        if msg_type == MessageType::MsgAppend {
+                            flag = false;
+                        }
+                    }
+                    if flag {
+                        if let Err(e) = ch.send_raft_msg(msg) {
+                            return future::err(Error::from(e));
+                        }
+                    } else {
+                        return future::err(Error::from(RaftStoreError::DiskFull));
                     }
                 }
                 future::ok(())

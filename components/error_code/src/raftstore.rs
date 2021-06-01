@@ -28,7 +28,8 @@ define_error_codes!(
 
     SNAP_ABORT => ("SnapAbort", "", ""),
     SNAP_TOO_MANY => ("SnapTooMany", "", ""),
-    SNAP_UNKNOWN => ("SnapUnknown", "", "")
+    SNAP_UNKNOWN => ("SnapUnknown", "", ""),
+    DISK_FULL => ("Disk full, read only","","")
 );
 
 impl ErrorCodeExt for errorpb::Error {

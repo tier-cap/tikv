@@ -126,6 +126,9 @@ pub enum Error {
 
     #[error("Encryption {0}")]
     Encryption(#[from] encryption::Error),
+
+    #[error("DiskFull")] //TODO
+    DiskFull,
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -273,6 +276,7 @@ impl ErrorCodeExt for Error {
             #[cfg(feature = "prost-codec")]
             Error::ProstEncode(_) => error_code::raftstore::PROTOBUF,
             Error::DataIsNotReady { .. } => error_code::raftstore::DATA_IS_NOT_READY,
+            Error::DiskFull => error_code::raftstore::DISK_FULL,
 
             Error::Other(_) => error_code::raftstore::UNKNOWN,
         }
