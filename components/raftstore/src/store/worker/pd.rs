@@ -717,6 +717,12 @@ where
         if available == 0 {
             warn!("no available space");
         }
+        if available * 100 / capacity <= 5 {
+            warn!("Disk full event happen, business write traffic prohibit");
+            disk::WRITE_PERMISSION.store(false, Ordering::Release);
+        } else {
+            disk::WRITE_PERMISSION.store(true, Ordering::Release);
+        }
 
         stats.set_available(available);
         stats.set_bytes_read(
