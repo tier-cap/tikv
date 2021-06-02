@@ -716,10 +716,17 @@ where
         available = cmp::min(available, disk_stats.available_space());
         if available * 100 <= capacity * 5 {
             // 5% space left.
-            warn!("no available space, Disk full event happen, business write traffic prohibit");
+            warn!(
+                "no available space, disk usage check available={},capacity={}",
+                available, capacity
+            );
             disk::WRITE_PERMISSION.store(false, Ordering::Release);
             available = 0;
         } else {
+            warn!(
+                "disk usage check, available={},capacity={}",
+                available, capacity
+            );
             disk::WRITE_PERMISSION.store(true, Ordering::Release);
         }
 
