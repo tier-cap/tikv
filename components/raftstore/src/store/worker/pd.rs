@@ -714,12 +714,11 @@ where
         let mut available = capacity.checked_sub(used_size).unwrap_or_default();
         // We only care about rocksdb SST file size, so we should check disk available here.
         available = cmp::min(available, disk_stats.available_space());
-        if available == 0 {
-            warn!("no available space");
-        }
-        if available * 100 / capacity <= 5 {
-            warn!("Disk full event happen, business write traffic prohibit");
+        if available * 100 <= capacity * 5 {
+            // 5% space left.
+            warn!("no available space, Disk full event happen, business write traffic prohibit");
             disk::WRITE_PERMISSION.store(false, Ordering::Release);
+            available = 0;
         } else {
             disk::WRITE_PERMISSION.store(true, Ordering::Release);
         }

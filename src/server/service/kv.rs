@@ -41,7 +41,7 @@ use kvproto::mpp::*;
 use kvproto::raft_cmdpb::{CmdType, RaftCmdRequest, RaftRequestHeader, Request as RaftRequest};
 use kvproto::raft_serverpb::*;
 use kvproto::tikvpb::*;
-use raft::eraftpb::MessageType;
+use raft::eraftpb::*;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::{Callback, CasualMessage, StoreMsg};
 use raftstore::{DiscardReason, Error as RaftStoreError};
@@ -631,14 +631,22 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                     if !disk::WRITE_PERMISSION.load(Ordering::Acquire) {
                         let msg_type = msg.get_message().get_msg_type();
                         if msg_type == MessageType::MsgAppend {
-                            flag = false;
+                            let entries = msg.get_message().get_entries();
+                            for entry in entries {
+                                if entry.entry_type == EntryType::EntryNormal
+                                    && entry.data.len() != 0
+                                {
+                                    flag = false;
+                                    break;
+                                }
+                            }
                         }
                     }
                     if flag {
                         let ret = ch.send_raft_msg(msg).map_err(Error::from);
                         return future::ready(ret);
                     } else {
-                        return future::err(Error::from(RaftStoreError::DiskFull));
+                        future::ok(())
                     }
                 }
             });
@@ -683,15 +691,21 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                     if !disk::WRITE_PERMISSION.load(Ordering::Acquire) {
                         let msg_type = msg.get_message().get_msg_type();
                         if msg_type == MessageType::MsgAppend {
-                            flag = false;
+                            let entries = msg.get_message().get_entries();
+                            for entry in entries {
+                                if entry.entry_type == EntryType::EntryNormal
+                                    && entry.data.len() != 0
+                                {
+                                    flag = false;
+                                    break;
+                                }
+                            }
                         }
                     }
                     if flag {
                         if let Err(e) = ch.send_raft_msg(msg) {
                             return future::err(Error::from(e));
                         }
-                    } else {
-                        return future::err(Error::from(RaftStoreError::DiskFull));
                     }
                 }
                 future::ok(())
