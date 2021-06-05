@@ -1,6 +1,5 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tikv_util::time::{duration_to_sec, Instant};
 
@@ -628,26 +627,17 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                     }))
                 } else {
                     let mut flag = true;
-                    if !disk::WRITE_PERMISSION.load(Ordering::Acquire) {
+                    if disk::is_disk_full() {
                         let msg_type = msg.get_message().get_msg_type();
                         if msg_type == MessageType::MsgAppend {
-                            let entries = msg.get_message().get_entries();
-                            for entry in entries {
-                                if entry.entry_type == EntryType::EntryNormal
-                                    && entry.data.len() != 0
-                                {
-                                    flag = false;
-                                    break;
-                                }
-                            }
+                            flag = false;
                         }
                     }
                     if flag {
                         let ret = ch.send_raft_msg(msg).map_err(Error::from);
                         return future::ready(ret);
-                    } else {
-                        future::ok(())
                     }
+                    return future::ok(());
                 }
             });
             let status = match res.await {
@@ -688,18 +678,10 @@ impl<T: RaftStoreRouter<RocksEngine> + 'static, E: Engine, L: LockManager> Tikv
                         }));
                     }
                     let mut flag = true;
-                    if !disk::WRITE_PERMISSION.load(Ordering::Acquire) {
+                    if disk::is_disk_full() {
                         let msg_type = msg.get_message().get_msg_type();
                         if msg_type == MessageType::MsgAppend {
-                            let entries = msg.get_message().get_entries();
-                            for entry in entries {
-                                if entry.entry_type == EntryType::EntryNormal
-                                    && entry.data.len() != 0
-                                {
-                                    flag = false;
-                                    break;
-                                }
-                            }
+                            flag = false;
                         }
                     }
                     if flag {

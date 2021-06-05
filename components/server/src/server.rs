@@ -17,20 +17,19 @@ use std::{
     fs::{self, File},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{atomic::AtomicU64, Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use concurrency_manager::ConcurrencyManager;
 use encryption_export::{data_key_manager_from_config, DataKeyManager};
 use engine_rocks::{
-    encryption::get_env as get_encrypted_env, file_system::get_env as get_inspected_env,
+    encryption::get_env as get_encrypted_env, file_system::get_env as get_inspected_env, util,
     RocksEngine,
 };
-use engine_traits::{compaction_job::CompactionJobInfo, Engines, RaftEngine, CF_DEFAULT, CF_WRITE};
+use engine_traits::{
+    compaction_job::CompactionJobInfo, Engines, RaftEngine, ALL_CFS, CF_DEFAULT, CF_WRITE,
+};
 use error_code::ErrorCodeExt;
 use file_system::{
     set_io_rate_limiter, BytesFetcher, IORateLimiter, MetricsManager as IOMetricsManager,
@@ -54,6 +53,7 @@ use raftstore::{
         config::RaftstoreConfigManager,
         fsm,
         fsm::store::{RaftBatchSystem, RaftRouter, StoreMeta, PENDING_MSG_CAP},
+        snap::SnapManager,
         AutoSplitController, GlobalReplicationState, LocalReader, SnapManagerBuilder,
         SplitCheckRunner, SplitConfigManager, StoreMsg,
     },
@@ -122,10 +122,11 @@ pub fn run_tikv(config: TiKvConfig) {
             tikv.init_encryption();
             let (limiter, fetcher) = tikv.init_io_utility();
             let engines = tikv.init_raw_engines(Some(limiter.clone()));
-            tikv.init_engines(engines);
+            tikv.init_engines(engines.clone());
             let server_config = tikv.init_servers();
             tikv.register_services();
             tikv.init_metrics_flusher(fetcher);
+            tikv.init_storage_stats_task(engines);
             tikv.run_server(server_config);
             tikv.run_status_server();
 
@@ -144,6 +145,7 @@ pub fn run_tikv(config: TiKvConfig) {
 const RESERVED_OPEN_FDS: u64 = 1000;
 
 const DEFAULT_METRICS_FLUSH_INTERVAL: Duration = Duration::from_millis(10_000);
+const DEFAULT_STORAGE_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A complete TiKV server.
 struct TiKVServer<ER: RaftEngine> {
@@ -156,7 +158,7 @@ struct TiKVServer<ER: RaftEngine> {
     resolver: resolve::PdStoreAddrResolver,
     state: Arc<Mutex<GlobalReplicationState>>,
     store_path: PathBuf,
-    //raft_path: Pathbuf, currently not impl.
+    snap_mgr: Option<SnapManager>,
     encryption_key_manager: Option<Arc<DataKeyManager>>,
     engines: Option<TiKVEngines<ER>>,
     servers: Option<Servers<ER>>,
@@ -227,11 +229,8 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         let latest_ts = block_on(pd_client.get_tso()).expect("failed to get timestamp from PD");
         let concurrency_manager = ConcurrencyManager::new(latest_ts);
 
-        if config.storage.reserve_space.0 != 0 {
-            disk::DISK_RESERVED.store(config.storage.reserve_space.0, Ordering::Release);
-        } else {
-            disk::DISK_RESERVED.store(5 * tikv_util::config::GB, Ordering::Release);
-        }
+        disk::set_disk_reserved(config.storage.reserve_space.0);
+
         TiKVServer {
             config,
             cfg_controller: Some(cfg_controller),
@@ -241,7 +240,8 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             system: Some(system),
             resolver,
             state,
-            store_path: store_path.clone(),
+            store_path,
+            snap_mgr: None,
             encryption_key_manager: None,
             engines: None,
             servers: None,
@@ -650,6 +650,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         node.try_bootstrap_store(engines.engines.clone())
             .unwrap_or_else(|e| fatal!("failed to bootstrap node id: {}", e));
 
+        self.snap_mgr = Some(snap_mgr.clone());
         // Create server
         let server = Server::new(
             node.id(),
@@ -946,6 +947,54 @@ impl<ER: RaftEngine> TiKVServer<ER> {
                 engine_metrics.flush(duration);
                 io_metrics.flush(duration);
             });
+    }
+
+    fn init_storage_stats_task(&self, engines: Engines<RocksEngine, ER>) {
+        let config_disk_capacity: u64 = self.config.raft_store.capacity.0;
+        let store_path = self.store_path.clone();
+        let snap_mgr = self.snap_mgr.clone().unwrap();
+        self.background_worker
+            .spawn_interval_task(DEFAULT_STORAGE_STATS_INTERVAL, move || {
+                let disk_stats = match fs2::statvfs(&store_path) {
+                    Err(e) => {
+                        error!(
+                            "get disk stat for kv store failed";
+                            "kv path"=>store_path.to_str(),
+                            "err"=>?e
+                        );
+                        return;
+                    }
+                    Ok(stats) => stats,
+                };
+                let disk_cap = disk_stats.total_space();
+                let snap_size = snap_mgr.get_total_snap_size().unwrap();
+
+                let mut kv_size: u64 = 0;
+                for cf in ALL_CFS {
+                    let handle = util::get_cf_handle(engines.kv.as_inner(), cf).unwrap();
+                    kv_size += util::get_engine_cf_used_size(engines.kv.as_inner(), handle);
+                }
+
+                let used_size = snap_size + kv_size;
+                let capacity = if config_disk_capacity == 0 || disk_cap < config_disk_capacity {
+                    disk_cap
+                } else {
+                    config_disk_capacity
+                };
+
+                let mut available = capacity.checked_sub(used_size).unwrap_or_default();
+                // We only care about rocksdb SST file size, so we should check disk available here.
+                available = cmp::min(available, disk_stats.available_space());
+                if available <= disk::get_disk_reserved() {
+                    warn!(
+                        "disk full, available={},snap={},engine={},capacity={}",
+                        available, snap_size, kv_size, capacity
+                    );
+                    disk::set_disk_full();
+                } else {
+                    disk::clear_disk_full();
+                }
+            })
     }
 
     fn run_server(&mut self, server_config: Arc<VersionTrack<ServerConfig>>) {

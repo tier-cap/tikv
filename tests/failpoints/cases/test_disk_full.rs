@@ -32,7 +32,7 @@ fn test_disk_full() {
         cluster.must_get(&must_key).unwrap();
     }
 
-    disk::clear_write_permission();
+    disk::set_disk_full();
     let disk_full_t = "disk_full_t";
     fail::cfg(disk_full_t, "panic").unwrap(); //TODO not good
     {
@@ -76,7 +76,7 @@ fn test_disk_full() {
     }
 
     fail::remove(disk_full_t);
-    disk::set_write_permission();
+    disk::clear_disk_full();
 
     println!("disk full test over");
 }

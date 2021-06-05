@@ -2280,10 +2280,10 @@ where
             }
             Ok(RequestPolicy::ReadIndex) => return self.read_index(ctx, req, err_resp, cb),
             Ok(RequestPolicy::ProposeNormal) => {
-                if disk::WRITE_PERMISSION.load(Ordering::Acquire) {
-                    self.propose_normal(ctx, req)
-                } else {
+                if disk::is_disk_full() {
                     Err(box_err!("disk full, all the business data write forbiden"))
+                } else {
+                    self.propose_normal(ctx, req)
                 }
             }
             Ok(RequestPolicy::ProposeTransferLeader) => {
@@ -2936,7 +2936,6 @@ where
         mut req: RaftCmdRequest,
     ) -> Result<Either<u64, u64>> {
         //when disk full, propose normal will never be called.
-        fail_point!("disk_full_t");
         if self.pending_merge_state.is_some()
             && req.get_admin_request().get_cmd_type() != AdminCmdType::RollbackMerge
         {

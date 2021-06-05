@@ -42,7 +42,6 @@ use futures::FutureExt;
 use pd_client::metrics::*;
 use pd_client::{Error, PdClient, RegionStat};
 use tikv_util::metrics::ThreadInfoStatistics;
-use tikv_util::sys::disk;
 use tikv_util::time::UnixSecs;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
 use tikv_util::worker::{FutureRunnable as Runnable, FutureScheduler as Scheduler, Stopped};
@@ -714,19 +713,8 @@ where
         let mut available = capacity.checked_sub(used_size).unwrap_or_default();
         // We only care about rocksdb SST file size, so we should check disk available here.
         available = cmp::min(available, disk_stats.available_space());
-        if available <= disk::DISK_RESERVED.load(Ordering::Acquire) {
-            warn!(
-                "no available space, disk usage check available={},capacity={}",
-                available, capacity
-            );
-            disk::clear_write_permission();
-            available = 0;
-        } else {
-            debug!(
-                "disk usage check, available={},capacity={}",
-                available, capacity
-            );
-            disk::set_write_permission();
+        if available == 0 {
+            warn!("no available space");
         }
 
         stats.set_available(available);
