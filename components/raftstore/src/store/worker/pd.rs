@@ -714,20 +714,19 @@ where
         let mut available = capacity.checked_sub(used_size).unwrap_or_default();
         // We only care about rocksdb SST file size, so we should check disk available here.
         available = cmp::min(available, disk_stats.available_space());
-        if available * 100 <= capacity * 5 {
-            // 5% space left.
+        if available <= disk::DISK_RESERVED.load(Ordering::Acquire) {
             warn!(
                 "no available space, disk usage check available={},capacity={}",
                 available, capacity
             );
-            disk::WRITE_PERMISSION.store(false, Ordering::Release);
+            disk::clear_write_permission();
             available = 0;
         } else {
-            warn!(
+            debug!(
                 "disk usage check, available={},capacity={}",
                 available, capacity
             );
-            disk::WRITE_PERMISSION.store(true, Ordering::Release);
+            disk::set_write_permission();
         }
 
         stats.set_available(available);

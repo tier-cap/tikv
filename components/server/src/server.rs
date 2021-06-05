@@ -17,7 +17,10 @@ use std::{
     fs::{self, File},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicU64, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -79,6 +82,7 @@ use tikv::{
 use tikv_util::{
     check_environment_variables,
     config::{ensure_dir_exist, VersionTrack},
+    sys::disk,
     sys::sys_quota::SysQuota,
     time::Monitor,
     worker::{Builder as WorkerBuilder, FutureWorker, LazyWorker, Worker},
@@ -223,6 +227,11 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         let latest_ts = block_on(pd_client.get_tso()).expect("failed to get timestamp from PD");
         let concurrency_manager = ConcurrencyManager::new(latest_ts);
 
+        if config.storage.reserve_space.0 != 0 {
+            disk::DISK_RESERVED.store(config.storage.reserve_space.0, Ordering::Release);
+        } else {
+            disk::DISK_RESERVED.store(5 * tikv_util::config::GB, Ordering::Release);
+        }
         TiKVServer {
             config,
             cfg_controller: Some(cfg_controller),
