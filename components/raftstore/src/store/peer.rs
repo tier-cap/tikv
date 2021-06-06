@@ -2280,7 +2280,17 @@ where
             }
             Ok(RequestPolicy::ReadIndex) => return self.read_index(ctx, req, err_resp, cb),
             Ok(RequestPolicy::ProposeNormal) => {
-                if disk::is_disk_full() {
+                let disk_full_precheck = || {
+                    if cfg!(feature = "failpoints") {
+                        fail_point!("disk_full_t", |_| {
+                            return true;
+                        });
+                        return false;
+                    } else {
+                        return false;
+                    }
+                };
+                if disk_full_precheck() || disk::is_disk_full() {
                     Err(box_err!("disk full, all the business data write forbiden"))
                 } else {
                     self.propose_normal(ctx, req)
