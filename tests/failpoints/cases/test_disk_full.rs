@@ -196,9 +196,9 @@ fn test_disk_already_full_allowed_behaviors() {
     must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
 
     //TODO Fix Test operations with
-    // cluster.set_allowed_level_on_disk_full(AllowedLevel::AllowedAlreadyFull);
-    // cluster.must_put(b"k00", b"v00");
-    // cluster.clear_allowed_level_on_disk_full();
+    cluster.set_allowed_level_on_disk_full(AllowedLevel::AllowedAlreadyFull);
+    cluster.must_put(b"k00", b"v00");
+    cluster.clear_allowed_level_on_disk_full();
 
     fail::remove("disk_already_full_peer_1");
     fail::remove("disk_already_full_peer_2");

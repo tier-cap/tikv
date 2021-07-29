@@ -16,6 +16,7 @@ use error_code::ErrorCodeExt;
 use fail::fail_point;
 use kvproto::errorpb;
 use kvproto::import_sstpb::SwitchMode;
+use kvproto::kvrpcpb::AllowedLevel;
 use kvproto::metapb::{self, Region, RegionEpoch};
 use kvproto::pdpb::CheckPolicy;
 use kvproto::raft_cmdpb::{
@@ -1268,10 +1269,11 @@ where
         );
 
         let msg_type = msg.get_message().get_msg_type();
+        let allowed_level = msg.get_allowed_level();
 
-        if disk::is_disk_threshold_2(self.ctx.disk_status, self.ctx.store.get_id()) {
-            // only leader transfer and winning log are allowed.
-            let mut allowed = true;
+        let mut allowed = true;
+        if disk::is_disk_threshold_1(self.ctx.disk_status, self.ctx.store.get_id()) {
+            // cc and winning log are always allowed.
             if MessageType::MsgAppend == msg_type {
                 let entries = msg.get_message().get_entries();
                 for i in entries {
@@ -1282,17 +1284,41 @@ where
                     }
                 }
             }
-
             if !allowed {
-                debug!(
-                    "skip {:?} because of disk full", msg_type;
-                    "region_id" => self.region_id(), "peer_id" => self.fsm.peer_id()
-                );
-                return Err(Error::DiskFull(
-                    self.ctx.store.get_id(),
-                    "disk full threshold2 happens".to_owned(),
-                ));
+                match allowed_level {
+                    AllowedLevel::AllowedNormal => allowed = false,
+                    _ => allowed = true,
+                }
             }
+        } else if disk::is_disk_threshold_2(self.ctx.disk_status, self.ctx.store.get_id()) {
+            // cc and winning log are always allowed.
+            if MessageType::MsgAppend == msg_type {
+                let entries = msg.get_message().get_entries();
+                for i in entries {
+                    let entry_type = i.get_entry_type();
+                    if EntryType::EntryNormal == entry_type && !i.get_data().is_empty() {
+                        allowed = false;
+                        break;
+                    }
+                }
+            }
+            if !allowed {
+                match allowed_level {
+                    AllowedLevel::AllowedAlreadyFull => allowed = true,
+                    _ => allowed = false,
+                }
+            }
+        }
+
+        if !allowed {
+            debug!(
+                "skip {:?} because of disk full", msg_type;
+                "region_id" => self.region_id(), "peer_id" => self.fsm.peer_id()
+            );
+            return Err(Error::DiskFull(
+                self.ctx.store.get_id(),
+                "disk full happens when deal with raft messages".to_owned(),
+            ));
         }
 
         if !self.validate_raft_msg(&msg) {

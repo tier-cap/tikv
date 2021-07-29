@@ -1073,9 +1073,10 @@ where
         T: Transport,
         I: IntoIterator<Item = eraftpb::Message>,
     {
+        let disk_status = disk::get_disk_status();
         for msg in msgs {
             let msg_type = msg.get_msg_type();
-            let i = self.send_raft_message(msg, trans) as usize;
+            let i = self.send_raft_message(msg, trans, disk_status) as usize;
             match msg_type {
                 MessageType::MsgAppend => metrics.append[i] += 1,
                 MessageType::MsgAppendResponse => {
@@ -3519,7 +3520,12 @@ where
         }
     }
 
-    fn send_raft_message<T: Transport>(&mut self, msg: eraftpb::Message, trans: &mut T) -> bool {
+    fn send_raft_message<T: Transport>(
+        &mut self,
+        msg: eraftpb::Message,
+        trans: &mut T,
+        disk_status: disk::DiskStatus,
+    ) -> bool {
         let mut send_msg = self.prepare_raft_message();
 
         let to_peer = match self.get_peer_from_cache(msg.get_to()) {
@@ -3564,6 +3570,16 @@ where
         }
 
         send_msg.set_message(msg);
+
+        // Set msg allowed level flag when different disk full threshold triggers.
+        let allowed_level = if disk::is_disk_threshold_1(disk_status, self.peer.get_store_id()) {
+            AllowedLevel::AllowedAlmostFull
+        } else if disk::is_disk_threshold_2(disk_status, self.peer.get_store_id()) {
+            AllowedLevel::AllowedAlreadyFull
+        } else {
+            AllowedLevel::AllowedNormal
+        };
+        send_msg.set_allowed_level(allowed_level);
 
         if let Err(e) = trans.send(send_msg) {
             // We use metrics to observe failure on production.
