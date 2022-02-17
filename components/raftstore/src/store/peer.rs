@@ -2290,6 +2290,7 @@ where
         mut cb: Callback<EK::Snapshot>,
         req: RaftCmdRequest,
         mut err_resp: RaftCmdResponse,
+        start: Option<tikv_util::time::Instant>,
     ) -> bool {
         if self.pending_remove {
             return false;
@@ -2308,9 +2309,23 @@ where
         let res = match policy {
             Ok(RequestPolicy::ReadLocal) => {
                 self.read_local(ctx, req, cb);
+                if let Some(st) = start {
+                    let d = st.saturating_elapsed();
+                    if d > Duration::from_millis(60) {
+                        info!("ReadLocal Read takes {:?}, region_id {}", d, self.region_id)
+                    }
+                }
                 return false;
             }
-            Ok(RequestPolicy::ReadIndex) => return self.read_index(ctx, req, err_resp, cb),
+            Ok(RequestPolicy::ReadIndex) => {
+                if let Some(st) = start {
+                    let d = st.saturating_elapsed();
+                    if d > Duration::from_millis(60) {
+                        info!("ReadIndex Read takes {:?}, region_id {}", d, self.region_id)
+                    }
+                }
+                return self.read_index(ctx, req, err_resp, cb);
+            }
             Ok(RequestPolicy::ProposeNormal) => self.propose_normal(ctx, req),
             Ok(RequestPolicy::ProposeTransferLeader) => {
                 return self.propose_transfer_leader(ctx, req, cb);

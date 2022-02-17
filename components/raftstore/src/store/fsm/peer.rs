@@ -518,6 +518,11 @@ where
     }
 
     pub fn handle_msgs(&mut self, msgs: &mut Vec<PeerMsg<EK>>) {
+        info!(
+            "handle msgs start";
+            "region_id" => self.fsm.region_id(),
+            "peer_id" => self.fsm.peer_id(),
+        );
         for m in msgs.drain(..) {
             match m {
                 PeerMsg::RaftMessage(msg) => {
@@ -539,11 +544,11 @@ where
                     if self.fsm.batch_req_builder.can_batch(&cmd.request, req_size) {
                         self.fsm.batch_req_builder.add(cmd, req_size);
                         if self.fsm.batch_req_builder.should_finish() {
-                            self.propose_batch_raft_command();
+                            self.propose_batch_raft_command(None);
                         }
                     } else {
-                        self.propose_batch_raft_command();
-                        self.propose_raft_command(cmd.request, cmd.callback)
+                        self.propose_batch_raft_command(Some(cmd.send_time));
+                        self.propose_raft_command(cmd.request, cmd.callback, Some(cmd.send_time))
                     }
                 }
                 PeerMsg::Tick(tick) => self.on_tick(tick),
@@ -573,16 +578,16 @@ where
             }
         }
         // Propose batch request which may be still waiting for more raft-command
-        self.propose_batch_raft_command();
+        self.propose_batch_raft_command(None);
     }
 
-    fn propose_batch_raft_command(&mut self) {
+    fn propose_batch_raft_command(&mut self, start: Option<tikv_util::time::Instant>) {
         if let Some(cmd) = self
             .fsm
             .batch_req_builder
             .build(&mut self.ctx.raft_metrics.propose)
         {
-            self.propose_raft_command(cmd.request, cmd.callback)
+            self.propose_raft_command(cmd.request, cmd.callback, start)
         }
     }
 
@@ -780,6 +785,7 @@ where
             } else if key.term <= compacted_term
                 && (key.idx < compacted_idx || key.idx == compacted_idx && !is_applying_snap)
             {
+                let start = tikv_util::time::Instant::now_coarse();
                 info!(
                     "deleting applied snap file";
                     "region_id" => self.fsm.region_id(),
@@ -799,6 +805,7 @@ where
                     }
                 };
                 self.ctx.snap_mgr.delete_snapshot(&key, a.as_ref(), false);
+                info!("delete snapshot takes {:?}ms", start.saturating_elapsed());
             }
         }
     }
@@ -838,6 +845,7 @@ where
                     },
                 )
             })),
+            None,
         );
     }
 
@@ -938,7 +946,7 @@ where
             self.region().get_region_epoch().clone(),
             self.fsm.peer.peer.clone(),
         );
-        self.propose_raft_command(msg, cb);
+        self.propose_raft_command(msg, cb, None);
     }
 
     fn on_role_changed(&mut self, ready: &Ready) {
@@ -2709,7 +2717,7 @@ where
             request.set_admin_request(admin);
             request
         };
-        self.propose_raft_command(req, Callback::None);
+        self.propose_raft_command(req, Callback::None, None);
     }
 
     fn on_check_merge(&mut self) {
@@ -3371,7 +3379,12 @@ where
         }
     }
 
-    fn propose_raft_command(&mut self, mut msg: RaftCmdRequest, cb: Callback<EK::Snapshot>) {
+    fn propose_raft_command(
+        &mut self,
+        mut msg: RaftCmdRequest,
+        cb: Callback<EK::Snapshot>,
+        start: Option<tikv_util::time::Instant>,
+    ) {
         match self.pre_propose_raft_command(&msg) {
             Ok(Some(resp)) => {
                 cb.invoke_with_response(resp);
@@ -3417,7 +3430,7 @@ where
         let mut resp = RaftCmdResponse::default();
         let term = self.fsm.peer.term();
         bind_term(&mut resp, term);
-        if self.fsm.peer.propose(self.ctx, cb, msg, resp) {
+        if self.fsm.peer.propose(self.ctx, cb, msg, resp, start) {
             self.fsm.has_ready = true;
         }
 
@@ -3585,7 +3598,7 @@ where
         let peer = self.fsm.peer.peer.clone();
         let term = self.fsm.peer.get_index_term(compact_idx);
         let request = new_compact_log_request(region_id, peer, compact_idx, term);
-        self.propose_raft_command(request, Callback::None);
+        self.propose_raft_command(request, Callback::None, None);
 
         self.fsm.skip_gc_raft_log_ticks = 0;
         self.register_raft_gc_log_tick();
@@ -4005,7 +4018,7 @@ where
             self.fsm.peer.peer.clone(),
             &self.fsm.peer.consistency_state,
         );
-        self.propose_raft_command(req, Callback::None);
+        self.propose_raft_command(req, Callback::None, None);
     }
 
     fn on_ingest_sst_result(&mut self, ssts: Vec<SSTMetaInfo>) {

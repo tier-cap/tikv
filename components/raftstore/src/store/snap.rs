@@ -566,8 +566,14 @@ impl Snapshot {
     }
 
     fn load_snapshot_meta(&mut self) -> RaftStoreResult<()> {
+        info!(
+            "load_snapshot_meta start";
+            "region_id" => self.key.region_id);
         let snapshot_meta = self.read_snapshot_meta()?;
         self.set_snapshot_meta(snapshot_meta)?;
+        info!(
+            "load_snapshot_meta finish";
+            "region_id" => self.key.region_id);
         // check if there is a data corruption when the meta file exists
         // but cf files are deleted.
         if !self.exists() {

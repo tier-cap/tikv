@@ -109,11 +109,13 @@ impl SlowTimer {
     }
 }
 
-const DEFAULT_SLOW_SECS: u64 = 1;
+// const DEFAULT_SLOW_SECS: u64 = 1;
+const DEFAULT_SLOW_MILLIS: u64 = 60;
 
 impl Default for SlowTimer {
     fn default() -> SlowTimer {
-        SlowTimer::from_secs(DEFAULT_SLOW_SECS)
+        // SlowTimer::from_secs(DEFAULT_SLOW_SECS)
+        SlowTimer::from_secs(DEFAULT_SLOW_MILLIS)
     }
 }
 
